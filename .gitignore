@@ -1,0 +1,78 @@
+# Local agent/tool state
+.agents/
+.codex/
+CLAUDE.md
+CODEX.md
+
+# Backup / editor scratch files
+*.bak
+*.orig
+*.swp
+*~
+
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment and local config
+.env
+.env.*
+*.local
+
+# Maven and Java build output
+/target/
+*.class
+*.jar
+*.war
+*.ear
+
+# Ghidra/decompiler local artifacts
+*.gpr
+*.rep/
+*.lock
+*.log
+hs_err_pid*
+replay_pid*
+
+# Built archives and distributables
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+
+# Third-party Ghidra libraries
+lib/*.jar
+!lib/.gitignore
+
+# IDE/editor files
+.idea/
+*.iml
+*.iws
+.project
+.classpath
+.settings/
+.vscode/
+out/
+bin/
+
+# OS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+
+# Maven wrapper metadata if generated locally
+.mvn/*
+!.mvn/wrapper/
+!.mvn/wrapper/maven-wrapper.jar

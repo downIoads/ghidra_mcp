@@ -1,0 +1,6 @@
+Manifest-Version: 1.0
+Plugin-Class: com.downIoads.GhidraMCPPlugin
+Plugin-Name: GhidraMCP
+Plugin-Version: 1.0
+Plugin-Author: downIoads
+Plugin-Description: Embedded HTTP server for Ghidra MCP clients
