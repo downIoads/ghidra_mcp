@@ -412,6 +412,11 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, getXrefsTo(address, offset, limit));
         });
 
+        registerContext("/xrefs_via_pool", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendResponse(exchange, getXrefsViaPool(qparams));
+        });
+
         registerContext("/xrefs_from", exchange -> {
             Map<String, String> qparams = parseQueryParams(exchange);
             String address = qparams.get("address");
@@ -3619,6 +3624,149 @@ public class GhidraMCPPlugin extends Plugin {
             return paginateList(refs, offset, limit);
         } catch (Exception e) {
             return "Error getting references to address: " + e.getMessage();
+        }
+    }
+
+    /**
+     * Find functions whose PC-relative literal pool contains the requested address.
+     * This is intentionally read-only: it reports the missing relationship without
+     * creating Reference Manager edges.
+     */
+    private String getXrefsViaPool(Map<String, String> params) {
+        Program program = getCurrentProgram();
+        if (program == null) return jsonError("No program loaded");
+
+        try {
+            Address target = parseAddress(program, params.get("address"));
+            int offset = parseIntOrDefault(params.get("offset"), 0);
+            int limit = parseIntOrDefault(params.get("limit"), 100);
+            int maxScan = Math.max(1, parseIntOrDefault(params.get("max_scan"), 1_000_000));
+            boolean matchThumbBit = parseBooleanFlag(params.getOrDefault("match_thumb_bit", "false"));
+
+            Function scopeFunc = getFunctionByAddressOrName(program,
+                params.get("function_address"), params.get("function_name"));
+            Address scopeStart = optionalAddress(program, params.get("start"));
+            Address scopeEnd = optionalAddress(program, params.get("end"));
+
+            Listing listing = program.getListing();
+            InstructionIterator it;
+            if (scopeFunc != null) {
+                it = listing.getInstructions(scopeFunc.getBody(), true);
+            } else if (scopeStart != null && scopeEnd != null) {
+                it = listing.getInstructions(new AddressSet(scopeStart, scopeEnd), true);
+            } else if (scopeStart != null) {
+                it = listing.getInstructions(scopeStart, true);
+            } else {
+                it = listing.getInstructions(true);
+            }
+
+            ProgramContext ctx = program.getProgramContext();
+            Register tmode = ctx.getRegister("TMode");
+            FunctionManager functionManager = program.getFunctionManager();
+            Memory memory = program.getMemory();
+            int ptrSize = program.getDefaultPointerSize();
+            long targetOffset = target.getOffset();
+
+            Map<String, Map<String, Object>> grouped = new LinkedHashMap<>();
+            int scanned = 0;
+            int ldrCandidates = 0;
+            int poolReads = 0;
+            int matches = 0;
+            boolean truncated = false;
+
+            while (it.hasNext()) {
+                if (scanned >= maxScan) {
+                    truncated = true;
+                    break;
+                }
+                Instruction instr = it.next();
+                scanned++;
+                if (!isLdrLikeMnemonic(instr.getMnemonicString())) continue;
+
+                boolean isThumb = false;
+                if (tmode != null) {
+                    try {
+                        RegisterValue rv = ctx.getRegisterValue(tmode, instr.getAddress());
+                        if (rv != null && rv.hasValue() &&
+                            rv.getUnsignedValue() != null &&
+                            rv.getUnsignedValue().signum() != 0) {
+                            isThumb = true;
+                        }
+                    } catch (Exception ignore) {}
+                }
+
+                for (int i = 0; i < instr.getNumOperands(); i++) {
+                    Address poolAddr = extractPcRelativeTarget(program, instr, i, isThumb);
+                    if (poolAddr == null) continue;
+                    ldrCandidates++;
+                    if (!memory.contains(poolAddr) || memory.getBlock(poolAddr) == null) continue;
+
+                    long pointerValue;
+                    try {
+                        pointerValue = readPointerValue(program, poolAddr);
+                        poolReads++;
+                    } catch (Exception ex) {
+                        continue;
+                    }
+
+                    boolean exactMatch = pointerValue == targetOffset;
+                    boolean lowBitAliasMatch = !exactMatch && matchThumbBit &&
+                        ((pointerValue & ~1L) == (targetOffset & ~1L));
+                    if (!exactMatch && !lowBitAliasMatch) continue;
+
+                    Function func = functionManager.getFunctionContaining(instr.getAddress());
+                    String key = func != null
+                        ? func.getEntryPoint().toString()
+                        : "NO_FUNCTION@" + instr.getAddress();
+                    Map<String, Object> group = grouped.get(key);
+                    if (group == null) {
+                        group = new LinkedHashMap<>();
+                        if (func != null) {
+                            group.put("function", func.getName());
+                            group.put("function_entry", func.getEntryPoint().toString());
+                        } else {
+                            group.put("function", null);
+                            group.put("function_entry", null);
+                        }
+                        group.put("matches", new ArrayList<Object>());
+                        grouped.put(key, group);
+                    }
+
+                    Map<String, Object> evidence = new LinkedHashMap<>();
+                    evidence.put("instruction", instr.getAddress().toString());
+                    evidence.put("mnemonic", instr.getMnemonicString());
+                    evidence.put("operand", i);
+                    evidence.put("thumb", isThumb);
+                    evidence.put("pool_address", poolAddr.toString());
+                    evidence.put("pointer_value",
+                        String.format("0x%0" + Math.max(1, ptrSize * 2) + "x", pointerValue));
+                    evidence.put("exact_match", exactMatch);
+                    evidence.put("low_bit_alias_match", lowBitAliasMatch);
+                    MemoryBlock block = memory.getBlock(poolAddr);
+                    evidence.put("pool_block", block != null ? block.getName() : null);
+
+                    @SuppressWarnings("unchecked")
+                    List<Object> matchList = (List<Object>) group.get("matches");
+                    matchList.add(evidence);
+                    matches++;
+                }
+            }
+
+            List<Object> items = new ArrayList<>(grouped.values());
+            Map<String, Object> data = paginatedData(offset, limit, items);
+            data.put("target", target.toString());
+            data.put("target_offset", String.format("0x%x", targetOffset));
+            data.put("pointer_size", ptrSize);
+            data.put("match_thumb_bit", matchThumbBit);
+            data.put("scanned_instructions", scanned);
+            data.put("ldr_pc_candidates", ldrCandidates);
+            data.put("pool_reads", poolReads);
+            data.put("matching_pool_entries", matches);
+            data.put("truncated", truncated);
+            data.put("max_scan", maxScan);
+            return jsonOk(data);
+        } catch (Exception e) {
+            return jsonError("xrefs_via_pool error: " + e.getMessage());
         }
     }
 

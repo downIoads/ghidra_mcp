@@ -30,6 +30,7 @@ Read and navigation tools currently exposed:
 - `decompile_function_by_address`
 - `disassemble_function`
 - `get_xrefs_to`
+- `get_xrefs_via_pool`
 - `get_xrefs_from`
 - `get_function_xrefs`
 - `list_symbols`
@@ -695,7 +696,7 @@ are supplied.
   GBA memory map, optionally seed disassembly, start analysis
   asynchronously. Raw-binary loaders don't emit entry points, so the
   first analysis pass finds 0 functions; pass
-  `seed_addresses="0x08000000,0x080000C0,..."` (comma-separated) and/or
+  `seed_addresses="<entry>,<entry>,..."` (comma-separated) and/or
   `seed_image_base=true` to disassemble at those locations BEFORE
   analysis runs, giving the analyzer something to follow. Reported
   back as `disassemble_seeds` in the response. With `wait_ms>0`, blocks
@@ -727,17 +728,15 @@ instruction to the literal address with `SourceType.ANALYSIS`.
 
 When `seed_pointer_refs=true` (default), the same pass also reads the
 pointer-sized word at each constant-pool slot. If that value resolves
-to an address contained in loaded memory (e.g. an EWRAM pointer like
-`gSaveBlock2Ptr=0x03005390`, an IWRAM pointer, or a ROM pointer), the
-pass adds a `DATA` `SourceType.ANALYSIS` reference both from the LDR
-instruction and from the constant-pool slot to that pointer target.
+to an address contained in loaded memory, the pass adds a `DATA`
+`SourceType.ANALYSIS` reference both from the LDR instruction and from
+the constant-pool slot to that pointer target.
 The instruction-side edge means `xrefs_to(<pointer_target>)`
 enumerates every function that loads the pointer in a single query —
-"every function that touches `gSaveBlock2Ptr`" without walking the
-constant-pool intermediate. Pointer seeding also runs for LDR refs
-that were already present, so re-running on a previously-propagated
-program backfills the pointer-target edges without re-adding the LDR
-ref itself.
+without walking the constant-pool intermediate. Pointer seeding also
+runs for LDR refs that were already present, so re-running on a
+previously-propagated program backfills the pointer-target edges
+without re-adding the LDR ref itself.
 
 Returns `scanned_instructions`, `ldr_pc_candidates`, `added_count`,
 `already_present_count`, `seed_pointer_refs`, `pointer_candidates`,
@@ -752,6 +751,22 @@ propagated to the Reference Manager even with every reference
 analyzer enabled, and the related gap where the constant-pool slot
 itself holds an EWRAM/IWRAM/ROM pointer whose target gets no xref
 edges seeded by stock analysis.
+
+### `get_xrefs_via_pool(address, offset?, limit?, max_scan?, match_thumb_bit?, start?, end?, function_address?|function_name?)`
+
+Read-only companion to `get_xrefs_to` for the case where the target is
+only present as a pointer-sized value in a literal pool. It scans
+LDR-family PC-relative literal operands, reads the referenced pool
+slot, and returns the containing functions whose pool value matches
+`address`.
+
+The response is a structured JSON envelope paginated over matching
+functions. Each item includes the function name and entry point plus
+evidence entries with the instruction address, operand, pool address,
+pointer value, Thumb state, and pool memory block. `match_thumb_bit`
+defaults to `false`; when enabled, values that differ only by the low
+Thumb bit are also treated as matches. The scanner is address-agnostic
+and does not add or remove Reference Manager edges.
 
 ### `create_thumb_function_from_pointer(pointer_address, name?, force_mode?, create_pointer_data?, add_reference?)`
 

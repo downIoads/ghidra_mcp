@@ -126,6 +126,7 @@ Read and navigation tools:
 - `decompile_function_by_address`
 - `disassemble_function`
 - `get_xrefs_to`
+- `get_xrefs_via_pool`
 - `get_xrefs_from`
 - `get_function_xrefs`
 - `list_symbols`

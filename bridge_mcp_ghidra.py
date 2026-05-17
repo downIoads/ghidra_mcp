@@ -240,6 +240,48 @@ def get_xrefs_to(address: str, offset: int = 0, limit: int = 100) -> list:
     return safe_get("xrefs_to", {"address": address, "offset": offset, "limit": limit})
 
 @mcp.tool()
+def get_xrefs_via_pool(
+    address: str,
+    offset: int = 0,
+    limit: int = 100,
+    max_scan: int = 1000000,
+    match_thumb_bit: bool = False,
+    start: str = "",
+    end: str = "",
+    function_address: str = "",
+    function_name: str = "",
+) -> list:
+    """
+    Find functions whose PC-relative LDR literal pool contains the requested
+    address, even when normal xrefs_to(address) has no direct Reference Manager
+    edge.
+
+    Args:
+        address: Target address to look for as a pointer-sized literal-pool value.
+        offset: Pagination offset over matching functions.
+        limit: Maximum number of matching functions to return.
+        max_scan: Maximum number of instructions to scan.
+        match_thumb_bit: Also match values that differ only by the low Thumb bit.
+        start/end: Optional inclusive scan range.
+        function_address/function_name: Optional function scope.
+
+    Returns:
+        Structured JSON envelope with matching functions and pool evidence.
+    """
+    params = {
+        "address": address,
+        "offset": offset,
+        "limit": limit,
+        "max_scan": max_scan,
+        "match_thumb_bit": "true" if match_thumb_bit else "false",
+    }
+    if start: params["start"] = start
+    if end: params["end"] = end
+    if function_address: params["function_address"] = function_address
+    if function_name: params["function_name"] = function_name
+    return safe_get("xrefs_via_pool", params)
+
+@mcp.tool()
 def get_xrefs_from(address: str, offset: int = 0, limit: int = 100) -> list:
     """
     Get all references from the specified address (xref from).
@@ -963,7 +1005,7 @@ def read_bytes(address: str, length: int = 16) -> str:
     Useful for inspecting data tables, structs, and patch records.
 
     Args:
-        address: Start address in hex (e.g. "0x08000000" or "08000000").
+        address: Start address in hex.
         length:  Number of bytes to read (max 65536).
     """
     return "\n".join(safe_get("read_bytes", {"address": address, "length": length}))
@@ -972,7 +1014,6 @@ def read_bytes(address: str, length: int = 16) -> str:
 def write_bytes(address: str, hex: str) -> str:
     """
     Patch program memory at `address` with the bytes given as a hex string (whitespace ignored).
-    Example: write_bytes("0x08000000", "deadbeef")
     """
     return safe_post("write_bytes", {"address": address, "hex": hex})
 
@@ -980,7 +1021,6 @@ def write_bytes(address: str, hex: str) -> str:
 def find_bytes(hex: str, start: str = "", limit: int = 20) -> list:
     """
     Search program memory for a byte pattern. Use '??' for wildcards.
-    Example: find_bytes("fc7f0003", start="0x08000000")
     Returns the list of matching addresses (up to `limit`).
     """
     params = {"hex": hex, "limit": limit}
@@ -1042,13 +1082,12 @@ def propagate_ldr_pc_refs(
     Thumb uses (PC+4)&~3).
 
     When `seed_pointer_refs=True` (default), if the constant-pool slot holds a
-    value that resolves to loaded memory (e.g. EWRAM/IWRAM pointer like
-    gSaveBlock2Ptr=0x03005390), also adds a DATA reference from the LDR
-    instruction AND from the constant-pool slot to that pointer's target. This
-    makes `xrefs_to(<pointer_target>)` enumerate every function that loads the
-    pointer in a single query. Pointer seeding runs for already-present LDR
-    refs too, so re-running on a previously-propagated program backfills the
-    pointer-target edges.
+    value that resolves to loaded memory, also adds a DATA reference from the
+    LDR instruction AND from the constant-pool slot to that pointer's target.
+    This makes `xrefs_to(<pointer_target>)` enumerate every function that
+    loads the pointer in a single query. Pointer seeding runs for
+    already-present LDR refs too, so re-running on a previously-propagated
+    program backfills the pointer-target edges.
 
     Scope: function (by address or name), or [start, end] range, or full program.
     """
@@ -1157,8 +1196,7 @@ def analyze() -> str:
 @mcp.tool()
 def set_image_base(address: str) -> str:
     """
-    Move the program's image base to `address` (useful when raw binary loaded at 0
-    should actually live at a memory-mapped location like 0x08000000 for GBA ROMs).
+    Move the program's image base to `address`.
     """
     return safe_post("set_image_base", {"address": address})
 
