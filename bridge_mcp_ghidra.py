@@ -6,7 +6,10 @@
 # ]
 # ///
 
+import os
 import sys
+import shutil
+import subprocess
 import requests
 import argparse
 import logging
@@ -16,12 +19,30 @@ from mcp.server.fastmcp import FastMCP
 
 DEFAULT_GHIDRA_SERVER = "http://127.0.0.1:8080/"
 
+# Directory this bridge lives in — used to locate the start_ghidra.sh helper.
+BRIDGE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP("ghidra-mcp")
 
 # Initialize ghidra_server_url with default value
 ghidra_server_url = DEFAULT_GHIDRA_SERVER
+
+# Guidance appended to errors when the Ghidra backend is not reachable, so the
+# agent can recover on its own instead of asking the user to start Ghidra.
+_BACKEND_DOWN_HINT = (
+    "The Ghidra backend HTTP server is not running (connection refused). "
+    "It is NOT started automatically. Bring it up yourself with the "
+    "start_ghidra_server() tool (or run ./start_ghidra.sh), then retry. "
+    "Once it is up you can create_project / import_file / open_program yourself."
+)
+
+
+def _is_connection_error(exc: Exception) -> bool:
+    return isinstance(exc, (requests.exceptions.ConnectionError,
+                            requests.exceptions.Timeout))
+
 
 def safe_get(endpoint: str, params: dict = None) -> list:
     """
@@ -40,6 +61,8 @@ def safe_get(endpoint: str, params: dict = None) -> list:
         else:
             return [f"Error {response.status_code}: {response.text.strip()}"]
     except Exception as e:
+        if _is_connection_error(e):
+            return [f"Request failed: {str(e)}", _BACKEND_DOWN_HINT]
         return [f"Request failed: {str(e)}"]
 
 def safe_post(endpoint: str, data: dict | str) -> str:
@@ -55,7 +78,18 @@ def safe_post(endpoint: str, data: dict | str) -> str:
         else:
             return f"Error {response.status_code}: {response.text.strip()}"
     except Exception as e:
+        if _is_connection_error(e):
+            return f"Request failed: {str(e)}\n{_BACKEND_DOWN_HINT}"
         return f"Request failed: {str(e)}"
+
+
+def _server_is_up(timeout: float = 3.0) -> bool:
+    """True if the Ghidra backend answers /ready within `timeout` seconds."""
+    try:
+        r = requests.get(urljoin(ghidra_server_url, "ready"), timeout=timeout)
+        return r.ok
+    except Exception:
+        return False
 
 @mcp.tool()
 def list_methods(offset: int = 0, limit: int = 100) -> list:
@@ -2111,6 +2145,77 @@ def ready() -> str:
     default `Scalar Operand References` analyzer).
     """
     return "\n".join(safe_get("ready"))
+
+@mcp.tool()
+def ghidra_server_status() -> str:
+    """
+    Check whether the Ghidra backend HTTP server (the thing every other
+    mcp__ghidra__* tool talks to) is currently reachable.
+
+    Returns "up: <url>" if it answers, otherwise "down: <url>" plus a
+    reminder that you can start it yourself with start_ghidra_server().
+    Use this first whenever a tool fails with "connection refused".
+    """
+    if _server_is_up():
+        return f"up: {ghidra_server_url}"
+    return (f"down: {ghidra_server_url}\n"
+            "Backend not running. Start it yourself with start_ghidra_server() "
+            "(no need to ask the user).")
+
+
+@mcp.tool()
+def start_ghidra_server(project_path: str = "", timeout: int = 120) -> str:
+    """
+    Start the Ghidra backend yourself when it is not running (e.g. when other
+    tools fail with "connection refused"). You do NOT need to ask the user to
+    open Ghidra — call this instead.
+
+    Runs the bundled start_ghidra.sh helper, which launches a detached Ghidra
+    GUI with the GhidraMCP plugin and waits until the HTTP server answers
+    /ready. If a server is already up this is a no-op.
+
+    project_path: optional path to a Ghidra project (.gpr) to open. Leave empty
+        to restore the last project (whose CodeBrowser brings the server up).
+    timeout: seconds to wait for the server to come up (cold JVM start is slow).
+
+    After this returns "ok", the server is reachable and you can create a
+    project and import binaries yourself with create_project / import_file /
+    open_program / bring_up — no further user action required.
+    """
+    if _server_is_up():
+        return f"ok: Ghidra MCP server already running at {ghidra_server_url}"
+
+    script = os.path.join(BRIDGE_DIR, "start_ghidra.sh")
+    if not os.path.isfile(script):
+        return (f"error: launcher not found at {script}. "
+                "Run start_ghidra.sh from the GhidraMCP checkout manually.")
+
+    cmd = ["bash", script]
+    if project_path:
+        cmd.append(project_path)
+
+    env = dict(os.environ)
+    env["GHIDRA_SERVER_URL"] = ghidra_server_url
+    env["GHIDRA_START_TIMEOUT"] = str(timeout)
+
+    try:
+        # Give the subprocess a little headroom over its own internal timeout.
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              env=env, timeout=timeout + 30)
+    except subprocess.TimeoutExpired:
+        return ("error: start_ghidra.sh timed out. Ghidra may still be "
+                "starting — call ghidra_server_status() again shortly.")
+    except Exception as e:
+        return f"error: failed to run start_ghidra.sh: {e}"
+
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    if _server_is_up():
+        return f"ok: Ghidra MCP server is up at {ghidra_server_url}\n{out}"
+    detail = "\n".join(p for p in (out, err) if p)
+    return (f"error: server still not reachable at {ghidra_server_url} "
+            f"(exit {proc.returncode}).\n{detail}")
+
 
 @mcp.tool()
 def agent_hints() -> str:

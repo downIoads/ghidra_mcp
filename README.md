@@ -98,6 +98,42 @@ Claude Desktop example:
 }
 ```
 
+## Starting Ghidra Automatically
+
+The MCP bridge is a long-lived process and stays up even when Ghidra itself is
+not running. In that state every `mcp__ghidra__*` tool fails with a
+"connection refused" error because there is no backend HTTP server to talk to.
+
+You do not need to start Ghidra by hand. There are two ways to bring the
+backend up:
+
+- **From an MCP client (recommended):** call the `start_ghidra_server` tool.
+  It launches a detached Ghidra GUI with the GhidraMCP plugin and blocks until
+  the HTTP server answers. Use `ghidra_server_status` to check first. When a
+  tool fails with "connection refused", the error text now points at these
+  tools so the agent can recover on its own.
+
+- **From a shell:**
+
+  ```sh
+  ./start_ghidra.sh                 # restore last project + tools, wait for server
+  ./start_ghidra.sh /path/proj.gpr  # open a specific project, then wait
+  ./start_ghidra.sh --status        # just report whether the server is up
+  ```
+
+  Override the Ghidra install location with `GHIDRA_INSTALL_DIR`, the server
+  URL with `GHIDRA_SERVER_URL`, and the wait time with `GHIDRA_START_TIMEOUT`.
+
+Once the server is up you can create a project and import binaries entirely
+from MCP — `create_project`, `import_file`, `open_program`, and `bring_up`
+all work without any manual steps in the Ghidra UI.
+
+Note: the embedded server only starts once a CodeBrowser tool with
+`GhidraMCPPlugin` enabled is open. `ghidraRun` restores the previous session's
+tools by default, so a normal setup comes up automatically. If a fresh project
+opens with no program, open or import any program in the CodeBrowser to start
+the server.
+
 ## MCP Tools
 
 Read and navigation tools:

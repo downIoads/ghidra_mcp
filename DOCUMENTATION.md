@@ -938,3 +938,52 @@ Returns `{base, stride, count, readable_entries, encoding, entries:
 apply_errors?}`. When the underlying memory read returns fewer bytes
 than requested (end of block), `readable_entries` reflects what was
 actually decoded.
+
+## Implemented Phase 18: Agent-Driven Backend Startup
+
+The MCP bridge is a long-lived stdio process that stays up even when
+Ghidra itself is not running. Previously, in that state every tool just
+failed with a bare `Connection refused` and the agent had no in-band way
+to recover — it had to ask the user to open Ghidra. This phase makes the
+agent able to start the backend itself.
+
+### `start_ghidra.sh`
+
+Self-contained launcher (no Java changes — it drives the existing GUI
+plugin). Behaviour:
+
+- If the server already answers `/ready`, it is a no-op (never launches a
+  second instance).
+- Otherwise it resolves the Ghidra install (`GHIDRA_INSTALL_DIR`, else
+  autodetects `~/opt/ghidra_*` / `/opt/ghidra_*`), launches `ghidraRun`
+  detached in a new session (`setsid`) so the GUI/JVM survive the caller
+  (including the MCP bridge) exiting, and polls `/ready` until it comes up
+  or `GHIDRA_START_TIMEOUT` (default 120s) elapses.
+- `--status` reports up/down without launching. An optional `.gpr` path
+  argument opens a specific project; a non-existent path is ignored with a
+  warning rather than failing.
+
+`ghidraRun` restores the previous session's running tools by default, so a
+normal setup (CodeBrowser with `GhidraMCPPlugin` enabled, as saved in
+`_code_browser.tcd`) brings the HTTP server up automatically.
+
+### `start_ghidra_server(project_path?, timeout?)` and `ghidra_server_status()`
+
+Two new bridge-local MCP tools (they run in the bridge process and shell
+out, so they work precisely when the backend is *down*):
+
+- `ghidra_server_status()` — quick reachability probe; returns `up:`/`down:`
+  with a reminder that the agent can start the backend itself.
+- `start_ghidra_server(project_path="", timeout=120)` — no-op if already up;
+  otherwise runs `start_ghidra.sh` (passing `GHIDRA_SERVER_URL` /
+  `GHIDRA_START_TIMEOUT`) and reports whether the server became reachable.
+  After it returns `ok`, the agent uses the existing `create_project` /
+  `import_file` / `open_program` / `bring_up` tools to set up a project and
+  import binaries with no manual UI steps.
+
+### Actionable connection-refused errors
+
+`safe_get` / `safe_post` now detect `ConnectionError` / `Timeout`
+specifically and append a hint pointing at `start_ghidra_server()`, so when
+any tool fails because the backend is down the agent is told how to recover
+instead of surfacing a dead-end error to the user.
