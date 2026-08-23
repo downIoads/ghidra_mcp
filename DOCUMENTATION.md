@@ -1,5 +1,24 @@
 # GhidraMCP Completed Work
 
+## Automated Ghidra Lifecycle
+
+- `install.sh` enables `GhidraMCPPlugin` in existing Ghidra 12.2 CodeBrowser
+  configurations, eliminating the manual plugin checkbox.
+- `start_ghidra_server` opens a dedicated bootstrap project/program so a
+  CodeBrowser always starts, polls readiness every 250 ms, and defaults to a
+  bounded 10-second timeout.
+- Ghidra runs as a transient user systemd service, preserving desktop display
+  credentials while cleanly detaching it from the MCP stdio process.
+- `start_ghidra_server(project_path=..., program_path=...)` launches the
+  requested project and program directly.
+- `create_project` uses Ghidra's independent project API, so creating a project
+  does not close the bootstrap CodeBrowser or interrupt the MCP server.
+- `stop_ghidra_server` requests a clean exit, then terminates any remaining
+  Ghidra process even when the HTTP plugin is missing or stuck.
+- `activate_project` stops the bootstrap and launches the new project's
+  CodeBrowser; the installer-preconfigured GhidraMCP plugin is active there.
+- `ghidra_server_status` remains a non-mutating readiness probe.
+
 This document records implemented GhidraMCP capabilities.
 
 ## Current Tool Surface
@@ -528,9 +547,11 @@ containing memory `block`. The response carries `scanned_bytes` and a
   flag on success.
 - `close_program(name?, path?, ignore_changes?)` — close a program from
   the tool. Refuses unsaved changes unless `ignore_changes=true`.
-- `import_file(path, folder?, open?)` — import a binary from disk via
+- `import_file(path, folder?, open?, project_path?)` — import a binary from disk via
   Ghidra's `AutoImporter`. Places the result in the named project folder
-  (default: root) and optionally opens it in the active tool.
+  (default: root) and optionally opens it in the active tool. `project_path`
+  targets a different project without closing the bootstrap server. Imported
+  programs are saved and marked not to show the modal analysis prompt.
 - `open_program(path)` — open a program already stored in the active
   project, identified by its `DomainFile` path (e.g. `/MyBinary`).
 
@@ -601,7 +622,8 @@ bytes without modifying memory.
 - `close_project(save?)` — close the active project (saves first by
   default).
 - `create_project(path, name?)` — create a new project at the given
-  directory and make it active.
+  directory without tearing down the active MCP CodeBrowser. Import into it,
+  then call `activate_project(project_path, program_path)`.
 - `save_project` — flush project state (recent files / folder index).
 
 ### Project File Enumeration
@@ -955,31 +977,31 @@ plugin). Behaviour:
 - If the server already answers `/ready`, it is a no-op (never launches a
   second instance).
 - Otherwise it resolves the Ghidra install (`GHIDRA_INSTALL_DIR`, else
-  autodetects `~/opt/ghidra_*` / `/opt/ghidra_*`), launches `ghidraRun`
-  detached in a new session (`setsid`) so the GUI/JVM survive the caller
-  (including the MCP bridge) exiting, and polls `/ready` until it comes up
-  or `GHIDRA_START_TIMEOUT` (default 120s) elapses.
-- `--status` reports up/down without launching. An optional `.gpr` path
-  argument opens a specific project; a non-existent path is ignored with a
-  warning rather than failing.
+  autodetects `~/opt/ghidra_*` / `/opt/ghidra_*`), launches `ghidraRun` as a
+  transient user systemd service, and polls `/ready` until it comes up or
+  `GHIDRA_START_TIMEOUT` (default and maximum 10s) elapses.
+- `--status` reports up/down without launching. `--project FILE.gpr --program
+  /DOMAIN_PATH` launches that program directly in CodeBrowser.
 
 `ghidraRun` restores the previous session's running tools by default, so a
 normal setup (CodeBrowser with `GhidraMCPPlugin` enabled, as saved in
 `_code_browser.tcd`) brings the HTTP server up automatically.
 
-### `start_ghidra_server(project_path?, timeout?)` and `ghidra_server_status()`
+### Lifecycle bridge tools
 
 Two new bridge-local MCP tools (they run in the bridge process and shell
 out, so they work precisely when the backend is *down*):
 
 - `ghidra_server_status()` — quick reachability probe; returns `up:`/`down:`
   with a reminder that the agent can start the backend itself.
-- `start_ghidra_server(project_path="", timeout=120)` — no-op if already up;
+- `start_ghidra_server(project_path="", program_path="", timeout=10)` — no-op if already up;
   otherwise runs `start_ghidra.sh` (passing `GHIDRA_SERVER_URL` /
   `GHIDRA_START_TIMEOUT`) and reports whether the server became reachable.
-  After it returns `ok`, the agent uses the existing `create_project` /
-  `import_file` / `open_program` / `bring_up` tools to set up a project and
-  import binaries with no manual UI steps.
+- `stop_ghidra_server(timeout=10)` — cleanly exits when possible, then finds
+  and terminates all remaining Ghidra GUI processes owned by the user.
+- `activate_project(project_path, program_path, timeout=10)` — performs the
+  stop/start handoff into a newly created project, with the plugin enabled by
+  the CodeBrowser configuration installed by `install.sh`.
 
 ### Actionable connection-refused errors
 

@@ -19,6 +19,7 @@ This is useful for assisted reverse engineering: an MCP client can inspect funct
 - Java 21
 - Maven
 - Python 3.10 or newer
+- A user systemd session (`systemd-run`), used to detach Ghidra reliably
 - Python packages from `requirements.txt`
 
 ## Build The Ghidra Extension
@@ -66,7 +67,7 @@ The plugin listens on `http://127.0.0.1:8080/` by default.
 Install Python dependencies:
 
 ```sh
-python -m pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 ```
 
 For MCP clients that launch tools over `stdio`, point the client at:
@@ -104,35 +105,38 @@ The MCP bridge is a long-lived process and stays up even when Ghidra itself is
 not running. In that state every `mcp__ghidra__*` tool fails with a
 "connection refused" error because there is no backend HTTP server to talk to.
 
-You do not need to start Ghidra by hand. There are two ways to bring the
-backend up:
+You do not need to start Ghidra, open CodeBrowser, enable the plugin, create a
+project, or close Ghidra by hand. `./install.sh` enables the extension in the
+CodeBrowser tool configuration. The lifecycle tools use a small bootstrap
+project to make CodeBrowser start deterministically even when no previous tool
+session exists.
 
-- **From an MCP client (recommended):** call the `start_ghidra_server` tool.
-  It launches a detached Ghidra GUI with the GhidraMCP plugin and blocks until
-  the HTTP server answers. Use `ghidra_server_status` to check first. When a
-  tool fails with "connection refused", the error text now points at these
-  tools so the agent can recover on its own.
+There are two ways to bring the backend up:
+
+- **From an MCP client (recommended):** call `start_ghidra_server`. It launches
+  a detached Ghidra CodeBrowser and waits at most 10 seconds for the HTTP
+  server. Use `ghidra_server_status` to check first. Call
+  `stop_ghidra_server` to save and exit all Ghidra instances; it also
+  terminates instances whose HTTP plugin is unavailable.
 
 - **From a shell:**
 
   ```sh
-  ./start_ghidra.sh                 # restore last project + tools, wait for server
-  ./start_ghidra.sh /path/proj.gpr  # open a specific project, then wait
+  ./start_ghidra.sh                 # launch CodeBrowser bootstrap, wait <= 10s
   ./start_ghidra.sh --status        # just report whether the server is up
+  ./stop_ghidra.sh                  # cleanly stop, then force-stop if needed
   ```
 
   Override the Ghidra install location with `GHIDRA_INSTALL_DIR`, the server
   URL with `GHIDRA_SERVER_URL`, and the wait time with `GHIDRA_START_TIMEOUT`.
+  The launcher polls every 250 ms rather than waiting through a fixed delay.
 
 Once the server is up you can create a project and import binaries entirely
-from MCP — `create_project`, `import_file`, `open_program`, and `bring_up`
-all work without any manual steps in the Ghidra UI.
-
-Note: the embedded server only starts once a CodeBrowser tool with
-`GhidraMCPPlugin` enabled is open. `ghidraRun` restores the previous session's
-tools by default, so a normal setup comes up automatically. If a fresh project
-opens with no program, open or import any program in the CodeBrowser to start
-the server.
+from MCP. For a fresh project, call `create_project`, import with
+`import_file(project_path=...)`, then call `activate_project(project_path,
+program_path)`. This launches that project's CodeBrowser with GhidraMCP
+already enabled. Imports persist Ghidra's “No (Don't ask again)” analysis
+choice; analysis is started explicitly through `start_analysis`.
 
 ## MCP Tools
 

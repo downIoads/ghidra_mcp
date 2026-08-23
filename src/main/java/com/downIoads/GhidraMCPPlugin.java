@@ -100,6 +100,7 @@ import ghidra.framework.model.ProjectManager;
 import ghidra.framework.main.AppInfo;
 import ghidra.framework.main.FrontEndTool;
 import ghidra.app.util.importer.AutoImporter;
+import ghidra.base.project.GhidraProject;
 import ghidra.app.util.opinion.LoadResults;
 import ghidra.app.util.opinion.Loaded;
 import ghidra.app.util.opinion.Loader;
@@ -112,6 +113,7 @@ import ghidra.program.model.lang.CompilerSpec;
 import ghidra.program.model.lang.CompilerSpecID;
 import ghidra.program.model.lang.CompilerSpecDescription;
 import ghidra.program.util.DefaultLanguageService;
+import ghidra.program.util.GhidraProgramUtilities;
 import ghidra.app.services.GoToService;
 import ghidra.program.util.ProgramSelection;
 import generic.stl.Pair;
@@ -1192,6 +1194,20 @@ public class GhidraMCPPlugin extends Plugin {
 
         // ---------- Phase 13: navigation / readiness ----------
         registerContext("/ready", exchange -> sendResponse(exchange, ready()));
+        registerContext("/shutdown", exchange -> {
+            sendResponse(exchange, jsonOk(Collections.singletonMap("status", "shutting_down")));
+            Thread shutdownThread = new Thread(() -> {
+                try {
+                    Thread.sleep(100);
+                }
+                catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                SwingUtilities.invokeLater(AppInfo::exitGhidra);
+            }, "GhidraMCP-shutdown");
+            shutdownThread.setDaemon(true);
+            shutdownThread.start();
+        });
         registerContext("/agent_hints", exchange -> sendResponse(exchange, agentHints()));
         registerContext("/goto", exchange -> {
             Map<String, String> params = parsePostParams(exchange);
@@ -6280,6 +6296,7 @@ public class GhidraMCPPlugin extends Plugin {
                     AutoAnalysisManager mgr = AutoAnalysisManager.getAnalysisManager(program);
                     mgr.reAnalyzeAll(null);
                     mgr.startAnalysis(new ConsoleTaskMonitor());
+                    mgr.waitForAnalysis(null, new ConsoleTaskMonitor());
                     int n = program.getFunctionManager().getFunctionCount();
                     out.append("analysis complete; functions=").append(n);
                     ok.set(true);
@@ -7852,8 +7869,7 @@ public class GhidraMCPPlugin extends Plugin {
             String path = required(params.get("path"), "path");
             File file = new File(path);
             if (!file.exists() || !file.isFile()) return jsonError("file not found: " + path);
-            Project project = tool.getProject();
-            if (project == null) return jsonError("no active project");
+            String requestedProjectPath = trimOrNull(params.get("project_path"));
             String folderPath = params.get("folder");
             String projectFolderPath = (folderPath == null || folderPath.isEmpty()) ? "/" : folderPath;
             if (!projectFolderPath.startsWith("/")) projectFolderPath = "/" + projectFolderPath;
@@ -7895,29 +7911,45 @@ public class GhidraMCPPlugin extends Plugin {
             final CompilerSpec fCspec = compilerSpec;
             final Class<? extends Loader> fLoaderClass = loaderClass;
 
+            GhidraProject externalProject = null;
+            Project importProject = tool.getProject();
+            if (requestedProjectPath != null) {
+                ProjectLocator wanted = parseProjectLocator(requestedProjectPath);
+                ProjectLocator activeLocator = importProject != null ? importProject.getProjectLocator() : null;
+                if (activeLocator == null || !activeLocator.equals(wanted)) {
+                    externalProject = GhidraProject.openProject(
+                        wanted.getLocation(), wanted.getName(), true);
+                    importProject = externalProject.getProject();
+                }
+            }
+            if (importProject == null) return jsonError("no active or requested project");
+            final Project fImportProject = importProject;
+            final GhidraProject fExternalProject = externalProject;
+
             AtomicBoolean ok = new AtomicBoolean(false);
             final StringBuilder err = new StringBuilder();
             final Map<String, Object> result = new LinkedHashMap<>();
-            SwingUtilities.invokeAndWait(() -> {
-                LoadResults<Program> lr = null;
-                try {
+            try {
+                SwingUtilities.invokeAndWait(() -> {
+                    LoadResults<Program> lr = null;
+                    try {
                     MessageLog log = new MessageLog();
                     TaskMonitor monitor = new ConsoleTaskMonitor();
                     if (fLoaderClass != null && fLang != null) {
                         lr = AutoImporter.importByUsingSpecificLoaderClassAndLcs(
-                            file, project, pfPath, fLoaderClass, loaderOpts,
+                            file, fImportProject, pfPath, fLoaderClass, loaderOpts,
                             fLang, fCspec, this, log, monitor);
                     } else if (fLoaderClass != null) {
                         lr = AutoImporter.importByUsingSpecificLoaderClass(
-                            file, project, pfPath, fLoaderClass, loaderOpts,
+                            file, fImportProject, pfPath, fLoaderClass, loaderOpts,
                             this, log, monitor);
                     } else if (fLang != null) {
                         lr = AutoImporter.importByLookingForLcs(
-                            file, project, pfPath, fLang, fCspec,
+                            file, fImportProject, pfPath, fLang, fCspec,
                             this, log, monitor);
                     } else {
                         lr = AutoImporter.importByUsingBestGuess(
-                            file, project, pfPath, this, log, monitor);
+                            file, fImportProject, pfPath, this, log, monitor);
                     }
                     if (lr == null || lr.size() == 0) {
                         err.append("loader produced no programs");
@@ -7925,6 +7957,9 @@ public class GhidraMCPPlugin extends Plugin {
                         if (msg != null && !msg.isEmpty()) err.append(": ").append(msg);
                         return;
                     }
+                    // AutoImporter only creates in-memory Loaded objects. Save
+                    // them into the target project before opening/releasing.
+                    lr.save(monitor);
                     Program p = lr.getPrimaryDomainObject(this);
                     try {
                         if (imageBaseStr != null) {
@@ -7944,7 +7979,15 @@ public class GhidraMCPPlugin extends Plugin {
                         result.put("language", p.getLanguage().getLanguageID().toString());
                         result.put("compiler_spec", p.getCompilerSpec().getCompilerSpecID().toString());
                         result.put("image_base", p.getImageBase().toString());
-                        if (pm != null && openProgram) {
+                        result.put("project", fImportProject.getProjectLocator().toString());
+
+                        // Opening an unanalysed program normally displays Ghidra's
+                        // modal "Analyze?" question. MCP starts analysis explicitly,
+                        // so persist the equivalent of "No (Don't ask again)" first.
+                        GhidraProgramUtilities.markProgramNotToAskToAnalyze(p);
+                        if (df != null) df.save(monitor);
+
+                        if (pm != null && openProgram && fExternalProject == null) {
                             pm.openProgram(p);
                         }
                         ok.set(true);
@@ -7952,14 +7995,17 @@ public class GhidraMCPPlugin extends Plugin {
                         // release our consumer hold on the program; ProgramManager keeps its own hold if we opened it.
                         try { p.release(this); } catch (Exception ignored) {}
                     }
-                } catch (Throwable t) {
-                    err.append(t.getMessage() == null ? t.toString() : t.getMessage());
-                } finally {
-                    if (lr != null) {
-                        try { lr.release(this); } catch (Exception ignored) {}
+                    } catch (Throwable t) {
+                        err.append(t.getMessage() == null ? t.toString() : t.getMessage());
+                    } finally {
+                        if (lr != null) {
+                            try { lr.release(this); } catch (Exception ignored) {}
+                        }
                     }
-                }
-            });
+                });
+            } finally {
+                if (externalProject != null) externalProject.close();
+            }
             if (!ok.get()) return jsonError("import_file failed: " + err);
             return jsonOk(result);
         } catch (Exception e) {
@@ -8073,6 +8119,8 @@ public class GhidraMCPPlugin extends Plugin {
             SwingUtilities.invokeAndWait(() -> {
                 try {
                     Program p = (Program) f.getDomainObject(this, false, false, new ConsoleTaskMonitor());
+                    GhidraProgramUtilities.markProgramNotToAskToAnalyze(p);
+                    f.save(new ConsoleTaskMonitor());
                     pm.openProgram(p);
                     result.put("name", p.getName());
                     result.put("path", f.getPathname());
@@ -8943,34 +8991,28 @@ public class GhidraMCPPlugin extends Plugin {
         try {
             String path = required(params.get("path"), "path");
             String nameParam = params.get("name");
-            ProjectManager pm = getProjectManager();
-            if (pm == null) return jsonError("ProjectManager not available");
             File dir = new File(path);
             if (!dir.exists() && !dir.mkdirs()) return jsonError("cannot create directory: " + path);
             if (!dir.isDirectory()) return jsonError("not a directory: " + path);
             String name = (nameParam != null && !nameParam.isEmpty()) ? nameParam : dir.getName();
             ProjectLocator locator = new ProjectLocator(dir.getAbsolutePath(), name);
-            if (pm.projectExists(locator)) return jsonError("project already exists: " + locator);
-            AtomicReference<Project> created = new AtomicReference<>();
-            StringBuilder err = new StringBuilder();
-            SwingUtilities.invokeAndWait(() -> {
-                try {
-                    Project p = pm.createProject(locator, null, true);
-                    created.set(p);
-                    FrontEndTool fe = AppInfo.getFrontEndTool();
-                    if (fe != null) {
-                        try { fe.setActiveProject(p); } catch (Exception ignored) {}
-                    } else {
-                        AppInfo.setActiveProject(p);
-                    }
-                } catch (Throwable t) {
-                    err.append(t.getMessage() == null ? t.toString() : t.getMessage());
-                }
-            });
-            if (created.get() == null) return jsonError("create_project failed: " + err);
+            if (locator.exists()) return jsonError("project already exists: " + locator);
+
+            // The GUI ProjectManager can only own one active project. Creating
+            // through it while the bootstrap CodeBrowser is open fails, and
+            // closing that project would also destroy this HTTP server. The
+            // independent API creates and closes the project without touching
+            // the active CodeBrowser session.
+            GhidraProject created = GhidraProject.createProject(
+                dir.getAbsolutePath(), name, false);
+            Project project = created.getProject();
+            String projectName = project.getName();
+            created.close();
+
             Map<String, Object> r = new LinkedHashMap<>();
-            r.put("name", created.get().getName());
+            r.put("name", projectName);
             r.put("locator", locator.toString());
+            r.put("active", false);
             return jsonOk(r);
         } catch (Exception e) {
             return jsonError("create_project error: " + e.getMessage());
@@ -9281,6 +9323,10 @@ public class GhidraMCPPlugin extends Plugin {
                     tx = prog.startTransaction("start_analysis " + id);
                     if (reanalyze) mgr.reAnalyzeAll(null);
                     mgr.startAnalysis(job.monitor);
+                    // startAnalysis schedules work and may return before the
+                    // analyzer queue drains. Keep the async job "running"
+                    // until Ghidra itself reports completion.
+                    mgr.waitForAnalysis(null, job.monitor);
                     job.state = job.monitor.isCancelled() ? "cancelled" : "done";
                 } catch (Throwable th) {
                     job.error = th.getMessage() == null ? th.toString() : th.getMessage();

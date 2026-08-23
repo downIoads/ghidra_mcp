@@ -105,6 +105,13 @@ take_lock
 clean_python_env
 stop_running_bridges
 
+# A running JVM keeps the old extension loaded even after its files are
+# replaced. Stop it autonomously so this install is effective immediately.
+if [[ -f "${PROJECT_DIR}/stop_ghidra.sh" ]]; then
+    msg "Stopping Ghidra before replacing the extension"
+    GHIDRA_STOP_TIMEOUT=10 bash "${PROJECT_DIR}/stop_ghidra.sh"
+fi
+
 # 1. Sanity checks
 require_cmd mvn    "Install Maven to build the Ghidra extension."
 require_cmd java   "Install Java 21 to build the Ghidra extension."
@@ -135,6 +142,9 @@ else
     else
         ( cd "$GHIDRA_EXT_DIR" && python3 -m zipfile -e "$EXT_ZIP" . )
     fi
+
+    msg "Enabling GhidraMCP in every CodeBrowser tool configuration"
+    python3 "${PROJECT_DIR}/configure_ghidra.py" --version "${GHIDRA_VERSION%%_DEV}"
 
     if pgrep -f 'ghidra.*Ghidra' >/dev/null 2>&1 || pgrep -f 'GhidraRun' >/dev/null 2>&1; then
         warn "Ghidra is currently running — restart it to pick up the new extension."

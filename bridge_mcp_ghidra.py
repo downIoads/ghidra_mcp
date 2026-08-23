@@ -1815,19 +1815,22 @@ def close_program(name: str = "", path: str = "",
 
 @mcp.tool()
 def import_file(path: str, folder: str = "", open: bool = True,
+                project_path: str = "",
                 loader_name: str = "", language_id: str = "",
                 compiler_spec: str = "", image_base: str = "",
                 loader_options: str = "") -> str:
     """
-    Import a binary from disk into the active Ghidra project. By default
-    auto-detects the loader; pass loader_name (e.g. "GameBoyAdvanceLoader",
+    Import a binary from disk into a Ghidra project. By default this uses the
+    active project. Set project_path to import into another .gpr without
+    closing the bootstrap CodeBrowser; use activate_project() afterward.
+    Auto-detects the loader; pass loader_name (e.g. "GameBoyAdvanceLoader",
     "BinaryLoader") to force a specific loader, and language_id/compiler_spec
     (e.g. "ARM:LE:32:v4t" / "default") for raw-binary loads. image_base sets
     the program's image base after import. loader_options accepts either
     "key1=value1,key2=value2" or a JSON object string of loader options.
     """
     return safe_post("import_file", {
-        "path": path, "folder": folder,
+        "path": path, "folder": folder, "project_path": project_path,
         "open": "1" if open else "0",
         "loader_name": loader_name,
         "language_id": language_id,
@@ -2039,7 +2042,8 @@ def close_project(save: bool = True) -> str:
 def create_project(path: str, name: str = "") -> str:
     """
     Create a new Ghidra project at the given directory path. `name` defaults
-    to the directory's basename. Makes the new project active.
+    to the directory's basename. The active CodeBrowser remains on its current
+    project so project creation cannot tear down the MCP server.
     """
     return safe_post("create_project", {"path": path, "name": name})
 
@@ -2163,20 +2167,56 @@ def ghidra_server_status() -> str:
             "(no need to ask the user).")
 
 
+def _run_ghidra_launcher(project_path: str = "", program_path: str = "",
+                         timeout: int = 10) -> str:
+    script = os.path.join(BRIDGE_DIR, "start_ghidra.sh")
+    if not os.path.isfile(script):
+        return f"error: launcher not found at {script}"
+
+    timeout = max(1, min(timeout, 10))
+    cmd = ["bash", script]
+    if project_path:
+        if not program_path:
+            return "error: program_path is required with project_path"
+        cmd.extend(["--project", project_path, "--program", program_path])
+    env = dict(os.environ)
+    env["GHIDRA_SERVER_URL"] = ghidra_server_url
+    env["GHIDRA_START_TIMEOUT"] = str(timeout)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              env=env, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return ("error: Ghidra startup exceeded the short timeout; "
+                "call ghidra_server_status() to poll again")
+    except Exception as e:
+        return f"error: failed to run start_ghidra.sh: {e}"
+
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    if _server_is_up():
+        return f"ok: Ghidra MCP server is up at {ghidra_server_url}\n{out}".strip()
+    detail = "\n".join(p for p in (out, err) if p)
+    return (f"error: server still not reachable at {ghidra_server_url} "
+            f"(exit {proc.returncode}).\n{detail}")
+
+
 @mcp.tool()
-def start_ghidra_server(project_path: str = "", timeout: int = 120) -> str:
+def start_ghidra_server(project_path: str = "", program_path: str = "",
+                        timeout: int = 10) -> str:
     """
     Start the Ghidra backend yourself when it is not running (e.g. when other
     tools fail with "connection refused"). You do NOT need to ask the user to
     open Ghidra — call this instead.
 
     Runs the bundled start_ghidra.sh helper, which launches a detached Ghidra
-    GUI with the GhidraMCP plugin and waits until the HTTP server answers
-    /ready. If a server is already up this is a no-op.
+    CodeBrowser on a bootstrap project with GhidraMCP already enabled, then
+    waits until the HTTP server answers /ready. If a server is already up this
+    is a no-op.
 
-    project_path: optional path to a Ghidra project (.gpr) to open. Leave empty
-        to restore the last project (whose CodeBrowser brings the server up).
-    timeout: seconds to wait for the server to come up (cold JVM start is slow).
+    project_path/program_path: optional .gpr path and its DomainFile path
+        (for example /true). Supply both to launch that project's CodeBrowser
+        directly with GhidraMCP active; omit both for the bootstrap project.
+    timeout: short startup polling budget (default and maximum 10 seconds).
 
     After this returns "ok", the server is reachable and you can create a
     project and import binaries yourself with create_project / import_file /
@@ -2185,36 +2225,50 @@ def start_ghidra_server(project_path: str = "", timeout: int = 120) -> str:
     if _server_is_up():
         return f"ok: Ghidra MCP server already running at {ghidra_server_url}"
 
-    script = os.path.join(BRIDGE_DIR, "start_ghidra.sh")
+    return _run_ghidra_launcher(project_path, program_path, timeout)
+
+
+@mcp.tool()
+def stop_ghidra_server(timeout: int = 10) -> str:
+    """
+    Save open Ghidra state and exit the Ghidra GUI/backend without requiring
+    the user to close any windows. Returns after the HTTP backend is down.
+
+    timeout: seconds to wait for shutdown (default and maximum 10).
+    """
+    timeout = max(1, min(timeout, 10))
+    script = os.path.join(BRIDGE_DIR, "stop_ghidra.sh")
     if not os.path.isfile(script):
-        return (f"error: launcher not found at {script}. "
-                "Run start_ghidra.sh from the GhidraMCP checkout manually.")
-
-    cmd = ["bash", script]
-    if project_path:
-        cmd.append(project_path)
-
+        return f"error: stop helper not found at {script}"
     env = dict(os.environ)
     env["GHIDRA_SERVER_URL"] = ghidra_server_url
-    env["GHIDRA_START_TIMEOUT"] = str(timeout)
-
+    env["GHIDRA_STOP_TIMEOUT"] = str(timeout)
     try:
-        # Give the subprocess a little headroom over its own internal timeout.
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              env=env, timeout=timeout + 30)
+        proc = subprocess.run(["bash", script], capture_output=True, text=True,
+                              env=env, timeout=timeout)
     except subprocess.TimeoutExpired:
-        return ("error: start_ghidra.sh timed out. Ghidra may still be "
-                "starting — call ghidra_server_status() again shortly.")
+        return "error: Ghidra stop exceeded 10 seconds"
     except Exception as e:
-        return f"error: failed to run start_ghidra.sh: {e}"
+        return f"error: failed to run stop_ghidra.sh: {e}"
+    detail = "\n".join(p for p in (
+        (proc.stdout or "").strip(), (proc.stderr or "").strip()) if p)
+    return ("ok: " if proc.returncode == 0 else "error: ") + detail
 
-    out = (proc.stdout or "").strip()
-    err = (proc.stderr or "").strip()
-    if _server_is_up():
-        return f"ok: Ghidra MCP server is up at {ghidra_server_url}\n{out}"
-    detail = "\n".join(p for p in (out, err) if p)
-    return (f"error: server still not reachable at {ghidra_server_url} "
-            f"(exit {proc.returncode}).\n{detail}")
+
+@mcp.tool()
+def activate_project(project_path: str, program_path: str,
+                     timeout: int = 10) -> str:
+    """
+    Activate a newly created/imported project without user interaction.
+    Stops every existing Ghidra instance, then launches CodeBrowser directly
+    on project_path:program_path. The enabled GhidraMCP plugin loads in the
+    new project. Both stop and startup use short (<=10 second) waits.
+    """
+    stopped = stop_ghidra_server(timeout=min(timeout, 10))
+    if stopped.startswith("error:"):
+        return stopped
+    started = _run_ghidra_launcher(project_path, program_path, timeout)
+    return f"stop: {stopped}\nstart: {started}"
 
 
 @mcp.tool()
